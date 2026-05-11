@@ -64,6 +64,11 @@ type LazyLoadShard struct {
 	memMonitor       memwatch.AllocChecker
 	shardLoadLimiter *loadlimiter.LoadLimiter
 	lazyLoadSegments bool
+	// loadBlocked makes Load return loadBlockedErr without calling
+	// NewShard. RecoveringShard uses this so a lazy load before the
+	// SELF_RECOVERY rename doesn't silently MkdirAll an empty shard.
+	loadBlocked    bool
+	loadBlockedErr error
 }
 
 func NewLazyLoadShard(ctx context.Context, promMetrics *monitoring.PrometheusMetrics,
@@ -124,6 +129,10 @@ func (l *LazyLoadShard) Load(ctx context.Context) error {
 		return nil
 	}
 
+	if l.loadBlocked {
+		return l.loadBlockedErr
+	}
+
 	if err := l.memMonitor.CheckMappingAndReserve(3, int(lsmkv.FlushAfterDirtyDefault.Seconds())); err != nil {
 		return errors.Wrap(err, "memory pressure: cannot load shard")
 	}
@@ -153,6 +162,26 @@ func (l *LazyLoadShard) Load(ctx context.Context) error {
 	l.loaded = true
 
 	return nil
+}
+
+func (l *LazyLoadShard) blockLoad(blockErr error) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	l.loadBlocked = true
+	l.loadBlockedErr = blockErr
+}
+
+func (l *LazyLoadShard) clearLoadBlock() {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	l.loadBlocked = false
+	l.loadBlockedErr = nil
+}
+
+func (l *LazyLoadShard) isLoadBlocked() bool {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	return l.loadBlocked
 }
 
 func (l *LazyLoadShard) Index() *Index {

@@ -56,9 +56,27 @@ func StopNodeAtWithTimeout(ctx context.Context, t *testing.T, compose *docker.Do
 	<-time.After(1 * time.Second) // give time for shutdown
 }
 
+// WipeNodeDataAt simulates a data-loss event by deleting the persistence
+// directory contents inside the container at the given (0-based) index,
+// then SIGKILL-stops the container. The caller restarts via StartNodeAt
+// to bring the node back up with an empty data dir. Used by SELF_RECOVERY
+// acceptance tests. The wipe runs against the live container (PERSISTENCE
+// data is inside the container's overlay fs, no host volume), so Weaviate's
+// open fds survive the unlink; the immediate SIGKILL stop avoids graceful
+// shutdown attempts against the now-missing files.
+func WipeNodeDataAt(ctx context.Context, t *testing.T, compose *docker.DockerCompose, index int) {
+	t.Helper()
+	c, err := compose.ContainerAt(index)
+	require.NoError(t, err, "WipeNodeDataAt: container at index %d", index)
+	code, _, err := c.Container().Exec(ctx, []string{"sh", "-c", "rm -rf /data/*"})
+	require.NoError(t, err, "WipeNodeDataAt: exec rm -rf /data/* failed")
+	require.Equal(t, 0, code, "WipeNodeDataAt: rm -rf /data/* exited %d", code)
+	StopNodeAtWithTimeout(ctx, t, compose, index, 0)
+}
+
 // startNodeAt starts the node container at the given index.
 //
-// NOTE: the index is 1-based, so starting the first node requires index=1, not 0
+// NOTE: the index is 0-based, so starting the first node requires index=0.
 func StartNodeAt(ctx context.Context, t *testing.T, compose *docker.DockerCompose, index int) {
 	t.Helper()
 	if err := compose.StartAt(ctx, index); err != nil {

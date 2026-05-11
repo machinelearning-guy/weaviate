@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -67,6 +68,7 @@ type DB struct {
 	indexCheckpoints          *indexcheckpoint.Checkpoints
 	shutdown                  chan struct{}
 	startupComplete           atomic.Bool
+	raftBootstrapComplete     atomic.Bool
 	resourceScanState         *resourceScanState
 	memMonitor                *memwatch.Monitor
 
@@ -123,6 +125,10 @@ type DB struct {
 	// Shard.PutObject{,Batch} can call CheckObjects on the write path.
 	// nil disables the check. See docs/usage_limits.md.
 	usageLimits *usagelimits.Manager
+
+	// Set after the cluster service is up (it depends on Raft).
+	// Nil-safe: when nil, startup keeps today's MkdirAll behavior.
+	selfRecoveryOrchestrator SelfRecoveryOrchestrator
 }
 
 // SetUsageLimits installs the usage-limits Manager on the DB. Must be
@@ -130,6 +136,34 @@ type DB struct {
 // inherit the manager. See docs/usage_limits.md.
 func (db *DB) SetUsageLimits(m *usagelimits.Manager) {
 	db.usageLimits = m
+}
+
+// SelfRecoveryOrchestrator is the narrow surface used by the db package
+// to avoid an import cycle on cluster/replication.
+type SelfRecoveryOrchestrator interface {
+	// Enabled reports whether the SELF_RECOVERY feature flag is on.
+	// Callers must check this before installing a RecoveringShard
+	// wrapper; otherwise the wrapper would block load forever
+	// (SubmitRecovery no-ops when the flag is off).
+	Enabled() bool
+	// SubmitRecovery is non-blocking and a no-op when the flag is off.
+	SubmitRecovery(ctx context.Context, collection, shard string)
+}
+
+// SetSelfRecoveryOrchestrator must be called before WaitForStartup so
+// the startup shard-init pass can hand off recovering shards.
+func (db *DB) SetSelfRecoveryOrchestrator(o SelfRecoveryOrchestrator) {
+	db.selfRecoveryOrchestrator = o
+}
+
+// ShardPath returns the on-disk directory for (collection, shard).
+// Exposed so the self-recovery orchestrator can resolve target paths
+// without duplicating the path-construction rules.
+func (db *DB) ShardPath(collection, shard string) string {
+	return shardPath(
+		path.Join(db.config.RootPath, indexID(schema.ClassName(collection))),
+		shard,
+	)
 }
 
 func (db *DB) GetSchemaGetter() schemaUC.SchemaGetter {
@@ -169,6 +203,15 @@ func (db *DB) WaitForStartup(ctx context.Context) error {
 }
 
 func (db *DB) StartupComplete() bool { return db.startupComplete.Load() }
+
+// MarkRaftBootstrapComplete is called once RAFT has finished its initial
+// log/snapshot replay. After that point, AddClass calls reflect live
+// operator additions (not pre-existing data) so the SELF_RECOVERY hook
+// must skip them.
+func (db *DB) MarkRaftBootstrapComplete() { db.raftBootstrapComplete.Store(true) }
+
+// RaftBootstrapComplete reports whether the FSM replay window has ended.
+func (db *DB) RaftBootstrapComplete() bool { return db.raftBootstrapComplete.Load() }
 
 // IndexGetter interface defines the methods that the service uses from db.IndexGetter
 // This allows for better testability by using interfaces instead of concrete types
