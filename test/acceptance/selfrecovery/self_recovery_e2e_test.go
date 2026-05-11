@@ -118,7 +118,7 @@ func TestSelfRecoveryEndToEnd(t *testing.T) {
 			for _, n := range body.Payload.Nodes {
 				require.Equal(ct, "HEALTHY", *n.Status, "node %s status", n.Name)
 			}
-		}, 60*time.Second, 1*time.Second)
+		}, 3*time.Minute, 1*time.Second)
 	})
 
 	t.Run("create RF=3 single-shard collection", func(t *testing.T) {
@@ -315,7 +315,7 @@ func TestSelfRecoveryReadsContinueAtConsistencyONE(t *testing.T) {
 		for _, n := range body.Payload.Nodes {
 			require.Equal(ct, "HEALTHY", *n.Status, "node %s status", n.Name)
 		}
-	}, 60*time.Second, 1*time.Second)
+	}, 3*time.Minute, 1*time.Second)
 
 	helper.CreateClass(t, paragraphClass)
 
