@@ -697,6 +697,9 @@ func MakeAppState(ctx, serverShutdownCtx context.Context, options *swag.CommandL
 
 	// Wired after Cluster (Raft dep) and before WaitForStartup so the
 	// schema-replay shard-init pass can hand off missing-on-disk shards.
+	// (The bootstrap-window classification of empty-fallbacks is captured
+	// per-op at submit time from IndexConfig.RaftBootstrapComplete, so the
+	// orchestrator itself doesn't need that hook.)
 	selfRecoveryOrch := selfrecovery.New(selfrecovery.Config{
 		Raft:                   appState.ClusterService.Raft,
 		Schema:                 selfRecoverySchemaReader{r: appState.ClusterService.SchemaReader()},
@@ -707,7 +710,6 @@ func MakeAppState(ctx, serverShutdownCtx context.Context, options *swag.CommandL
 		Enabled:                appState.ServerConfig.Config.Replication.SelfRecoveryEnabled,
 		Concurrency:            appState.ServerConfig.Config.Replication.SelfRecoveryConcurrency,
 		MaintenanceModeEnabled: appState.Cluster.MaintenanceModeEnabledForLocalhost,
-		RaftBootstrapComplete:  appState.DB.RaftBootstrapComplete,
 		OnRecoveryComplete: func(ctx context.Context, collection, shard string) error {
 			idx := appState.DB.GetIndex(entschema.ClassName(collection))
 			if idx == nil {
@@ -718,8 +720,13 @@ func MakeAppState(ctx, serverShutdownCtx context.Context, options *swag.CommandL
 		Logger: appState.Logger,
 	})
 	appState.DB.SetSelfRecoveryOrchestrator(selfRecoveryOrch)
-	setupSelfRecoveryHandlers(appState, selfRecoveryOrch)
-	setupRaftDebugHandlers(appState, appState.ClusterService.Raft)
+	// The operator/debug HTTP endpoints (and the test-only force-snapshot
+	// endpoint) only make sense when the feature is on; don't expose them
+	// — even on the profiling port — when it's off.
+	if cfg := appState.ServerConfig.Config.Replication.SelfRecoveryEnabled; cfg != nil && cfg.Get() {
+		setupSelfRecoveryHandlers(appState, selfRecoveryOrch)
+		setupRaftDebugHandlers(appState, appState.ClusterService.Raft)
+	}
 	// One-shot reclaim of *.recovering/ leftovers from a downgrade.
 	if removed, err := selfRecoveryOrch.CleanupOrphanRecoveryDirs(dataPath); err != nil {
 		appState.Logger.WithError(err).Warn("self-recovery orphan cleanup failed")

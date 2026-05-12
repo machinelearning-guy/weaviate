@@ -637,7 +637,10 @@ func (i *Index) loadLocalShardIfActive(shardName string) error {
 // recoverShardFromPeerIfNeeded installs a RecoveringShard and submits
 // to the orchestrator when the on-disk dir is missing at startup AND
 // the SELF_RECOVERY feature is on. Returns true if recovery was kicked
-// off (caller must skip the normal init path).
+// off (caller must skip the normal init path); false otherwise — in
+// which case the caller proceeds with the normal init path (create empty
+// dir + async-rep backfill), so a queue-full / in-flight-op situation
+// degrades to today's behavior rather than stranding the shard.
 //
 // Only the startup path calls this; runtime shard creation
 // (initLocalShardWithForcedLoading, getOptInitLocalShard) is unaffected
@@ -645,6 +648,30 @@ func (i *Index) loadLocalShardIfActive(shardName string) error {
 func (i *Index) recoverShardFromPeerIfNeeded(ctx context.Context, class *models.Class,
 	shardName string, promMetrics *monitoring.PrometheusMetrics,
 ) bool {
+	if !i.shouldRecoverShardFromPeer(ctx, shardName) {
+		return false
+	}
+	rec := NewRecoveringShard(ctx, promMetrics, shardName, i, class, i.centralJobQueue,
+		i.indexCheckpoints, i.allocChecker, i.shardLoadLimiter, i.shardReindexer, i.bitmapBufPool)
+	i.shards.Store(shardName, rec)
+	i.logger.WithFields(logrus.Fields{
+		"action":     "self_recovery_submitted",
+		"collection": i.Config.ClassName.String(),
+		"shard":      shardName,
+	}).Info("local shard directory missing at startup; recovery from peer scheduled")
+	return true
+}
+
+// shouldRecoverShardFromPeer decides whether the startup hook should hand
+// (collection, shardName) off to the SELF_RECOVERY orchestrator, and — on
+// a true return — has already submitted the recovery (the caller only
+// needs to install the RecoveringShard wrapper). Returns false (caller
+// proceeds with normal init: empty dir + async-rep backfill) when the
+// feature is off, the ctx isn't a snapshot-reload, the dir already
+// exists, an in-flight replication op already owns the dir, or the
+// submission was declined (queue full) — so those situations degrade to
+// today's behavior rather than stranding the shard in RECOVERING.
+func (i *Index) shouldRecoverShardFromPeer(ctx context.Context, shardName string) bool {
 	orch := i.Config.SelfRecoveryOrchestrator
 	if orch == nil || !orch.Enabled() {
 		return false
@@ -663,18 +690,39 @@ func (i *Index) recoverShardFromPeerIfNeeded(ctx context.Context, class *models.
 		return false
 	}
 
-	rec := NewRecoveringShard(ctx, promMetrics, shardName, i, class, i.centralJobQueue,
-		i.indexCheckpoints, i.allocChecker, i.shardLoadLimiter, i.shardReindexer, i.bitmapBufPool)
-	i.shards.Store(shardName, rec)
+	collection := i.Config.ClassName.String()
+	logFields := logrus.Fields{"collection": collection, "shard": shardName}
+
+	// If a scale-out COPY/MOVE (or an earlier SELF_RECOVERY) op already
+	// targets this shard on this node, its consumer owns the shard dir —
+	// installing a wrapper + submitting another SELF_RECOVERY op here
+	// would race it and clobber its output on rename. Leave it to the
+	// existing op; if the dir is still missing on the next restart we
+	// retry. On error, be conservative and fall back to normal init.
+	if inflight, err := orch.HasInflightReplicationOp(ctx, collection, shardName); err != nil {
+		i.logger.WithError(err).WithFields(logFields).
+			Warn("self-recovery: could not check for in-flight replication op; falling back to normal shard init")
+		return false
+	} else if inflight {
+		i.logger.WithFields(logFields).
+			Info("self-recovery: an in-flight replication op already targets this shard; leaving recovery to that op")
+		return false
+	}
+
+	// Capture the bootstrap-window state now (deterministically, before
+	// MarkRaftBootstrapComplete can flip it) rather than re-reading a
+	// shared flag when the orchestrator reaches an empty-fallback decision
+	// several seconds of peer-probing later.
+	fromBootstrap := i.Config.RaftBootstrapComplete != nil && !i.Config.RaftBootstrapComplete()
+
 	// The recovery outlives the caller's ctx (schema-reload AddClass returns
 	// long before per-shard copies finish), so detach from it. The
 	// orchestrator manages its own lifecycle and shutdown.
-	orch.SubmitRecovery(context.Background(), i.Config.ClassName.String(), shardName)
-	i.logger.WithFields(logrus.Fields{
-		"action":     "self_recovery_submitted",
-		"collection": i.Config.ClassName.String(),
-		"shard":      shardName,
-	}).Info("local shard directory missing at startup; recovery from peer scheduled")
+	if !orch.SubmitRecovery(context.Background(), collection, shardName, fromBootstrap) {
+		i.logger.WithFields(logFields).
+			Warn("self-recovery: submission was not queued (queue full or feature disabled); falling back to normal shard init")
+		return false
+	}
 	return true
 }
 
@@ -1053,11 +1101,14 @@ type IndexConfig struct {
 	// for shards whose on-disk directory is missing: it submits a
 	// SELF_RECOVERY copy from a healthy peer. Nil-safe.
 	SelfRecoveryOrchestrator SelfRecoveryOrchestrator
-	// RaftBootstrapComplete reports whether RAFT has finished its
-	// initial FSM replay. The SELF_RECOVERY hook skips when true:
-	// once bootstrap is past, AddClass reflects live operator additions
-	// (a missing dir is the normal new-class case) rather than a node
-	// rejoining with pre-existing classes.
+	// RaftBootstrapComplete reports whether RAFT has finished its initial
+	// FSM replay. recoverShardFromPeerIfNeeded reads it when it submits a
+	// SELF_RECOVERY op (passing !RaftBootstrapComplete() as fromBootstrap)
+	// so the orchestrator can treat an all-peers-empty result during the
+	// bootstrap window as a likely fresh-class-added-during-downtime case
+	// rather than a catastrophic wipe. Captured at submit time to avoid a
+	// race with MarkRaftBootstrapComplete. Nil-safe: when nil, recoveries
+	// are treated as post-bootstrap.
 	RaftBootstrapComplete func() bool
 
 	HFreshEnabled bool

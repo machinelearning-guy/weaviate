@@ -117,6 +117,12 @@ func setupSelfRecoveryHandlers(appState *state.State, orch *selfrecovery.Orchest
 		if err := orch.RestartRecovery(context.WithoutCancel(r.Context()), collection, shard); err != nil {
 			logger.WithError(err).WithField("collection", collection).WithField("shard", shard).
 				Error("self-recovery restart failed")
+			// The shard already has a live local dir — nothing to restart.
+			// That's an operator-side mistake, not a 500.
+			if errors.Is(err, selfrecovery.ErrSelfRecoveryShardAlreadyLive) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

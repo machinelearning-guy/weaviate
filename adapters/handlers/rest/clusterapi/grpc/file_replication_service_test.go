@@ -13,6 +13,7 @@ package grpc
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -52,4 +53,25 @@ func TestListFiles_NilIndexReturnsUnavailable(t *testing.T) {
 	require.True(t, ok, "error must carry a gRPC status: %v", err)
 	require.Equal(t, codes.Unavailable, st.Code(),
 		"nil index must surface as Unavailable (transient), not NotFound (definitive); got %s", st.Code())
+}
+
+// TestIsShardAbsent pins the substring matcher that maps IncomingListFiles
+// errors to gRPC NotFound. It must match the canonical "shard is nil" /
+// "shard not found" phrasings (so a SELF_RECOVERY probe sees "definitively
+// no data") but nothing broader (e.g. a missing *file* must not be
+// misread as a missing shard).
+func TestIsShardAbsent(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("incoming list files: shard is nil"), true},
+		{errors.New("shard not found for collection X"), true},
+		{errors.New("file segment-123.db not found"), false},
+		{errors.New("some other transient error"), false},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.want, isShardAbsent(tc.err), "isShardAbsent(%v)", tc.err)
+	}
 }

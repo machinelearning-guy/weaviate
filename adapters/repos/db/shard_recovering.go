@@ -24,12 +24,22 @@ import (
 	"github.com/weaviate/weaviate/usecases/monitoring"
 )
 
-// RecoveringShard wraps a LazyLoadShard for SELF_RECOVERY. Until
-// Promote is called, GetStatus reports RECOVERING and the inner Load
-// is blocked (so a lazy load doesn't silently MkdirAll an empty shard
-// before the copy-and-rename completes). Cluster-wide routing exclusion
-// is handled separately by the FSM filter; this wrapper is local
+// RecoveringShard wraps a LazyLoadShard for SELF_RECOVERY. Until the
+// shard is promoted (via Load, called by the consumer's LoadLocalShard
+// or by the orchestrator's empty-fallback), GetStatus reports RECOVERING
+// and the inner Load is blocked with enterrors.ErrShardRecovering — so a
+// lazy load doesn't silently MkdirAll an empty shard before the
+// copy-and-rename completes. Cluster-wide routing exclusion is handled
+// separately by the replication FSM read filter; this wrapper is local
 // defense-in-depth.
+//
+// IMPORTANT: while blocked, any data-path method inherited from
+// LazyLoadShard that goes through mustLoad/mustLoadCtx (Store, NotifyReady,
+// Counter, the put*/delete*/update* internals, etc.) will PANIC rather
+// than return cleanly — reaching one of those is a routing bug. Callers
+// that iterate shards during the recovery window must skip recovering
+// shards (use the "loaded" shard accessors, or IsRecovering()). See
+// docs/self-recovery.md ("Known limitations").
 type RecoveringShard struct {
 	*LazyLoadShard
 }

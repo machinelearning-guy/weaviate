@@ -194,6 +194,8 @@ func newOrchestratorForTest(t *testing.T, raft RaftEntryPoint, schemaR SchemaRea
 	})
 	o.probeBackoffMin = 5_000_000 // 5ms
 	o.probeBackoffMax = 20_000_000
+	o.restartTimeout = 200 * time.Millisecond
+	o.vanishedGracePeriod = 10 * time.Millisecond
 	return o
 }
 
@@ -508,7 +510,7 @@ func TestSubmit_NoOpInMaintenanceMode(t *testing.T) {
 	// Submit must return immediately without spawning work; if it did
 	// spawn, the stubSchema (single replica = self) would fall through
 	// to actionEmptyFallback and create a directory.
-	o.Submit(context.Background(), ShardRef{Collection: "C", Shard: "S"})
+	o.Submit(context.Background(), ShardRef{Collection: "C", Shard: "S"}, false)
 
 	// Empty-fallback would have called PathResolver.ShardPath; we
 	// detect "did anything happen?" by checking the temp dir is empty.
@@ -549,7 +551,7 @@ func TestRunOne_CancelledTerminal(t *testing.T) {
 	done := make(chan struct{})
 	enterrorsGo := func() {
 		defer close(done)
-		o.runOne(context.Background(), ShardRef{Collection: "C", Shard: "S"})
+		o.runOne(context.Background(), ShardRef{Collection: "C", Shard: "S"}, false)
 	}
 	go enterrorsGo()
 

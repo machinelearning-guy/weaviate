@@ -65,11 +65,28 @@ rate(weaviate_self_recovery_giveup_total[15m]) > 0
 
 ## Operator escape hatches
 
+The `/debug/self-recovery/*` endpoints (and the test-only
+`POST /debug/raft/snapshot`) are registered **only when
+`SELF_RECOVERY_ENABLED=true`**. They live on the profiling/debug port,
+like the other `/debug/*` handlers.
+
 | Endpoint | When to use |
 |---|---|
 | `POST /replication/replicate/{id}/cancel` | abandon one in-flight op (any transfer type) |
-| `POST /debug/self-recovery/restart?collection=X&shard=Y` | abandon current SELF_RECOVERY attempt for the shard, erase partial `.recovering/` state, start fresh (probe re-randomises source peer selection) |
+| `POST /debug/self-recovery/restart?collection=X&shard=Y` | abandon current SELF_RECOVERY attempt for the shard, erase partial `.recovering/` state, start fresh (probe re-randomises source peer selection). **Valid only while the shard is `RECOVERING`** — if the live `<shard>/` directory already exists (recovery completed, or empty-fallback ran) it returns `409 Conflict`; cancel any in-flight op and remove the directory by hand if you really want to re-pull. |
 | `POST /debug/self-recovery/accept-empty?collection=X&shard=Y` | declare "no recoverable data exists, accept empty shard". Confirm via metrics/logs that all peers report no data first. |
+
+If retries are exhausted (`weaviate_self_recovery_giveup_total` ticks),
+the shard is left in `RECOVERING`; use `restart` to try again from
+scratch, or `accept-empty` to accept the loss. (Recoveries are also
+retried automatically on the next node restart.)
+
+When the in-process worker queue overflows (a node missing thousands of
+shards at once — `weaviate_self_recovery_submit_dropped_total` ticks),
+the affected shard falls back to the pre-existing behavior — an empty dir
+created at startup, backfilled object-by-object by async replication —
+rather than being stranded in `RECOVERING`. The dropped recovery is
+re-attempted on the next restart.
 
 ## Runbook: `no_data_empty_total > 0` after a restart
 
@@ -119,12 +136,27 @@ snapshot is taken after the first batch of schema changes; check
 `weaviate_raft_last_snapshot_index` in Prometheus to confirm a
 snapshot exists before trusting recovery on rejoin.
 
+**A `RecoveringShard` panics if a non-routed code path touches it.**
+While a shard is `RECOVERING`, an in-memory `RecoveringShard` wrapper
+sits in the index's shard map with its load blocked. The replication FSM
+read filter excludes it from cluster reads/writes for all consistency
+levels, and the "loaded" shard accessors skip it — but any maintenance
+loop or admin operation that iterates *all* shards and calls a data-path
+method (e.g. `Store()`, `addProperty`/`updateProperty` via `ForEachShard`)
+will hit `mustLoad` and **panic the node** with a "shard is recovering
+from a peer; this code path must not touch a recovering shard" message
+rather than failing gracefully. Avoid such operations while a shard on
+the node is recovering. (Hardening every such call site is deferred; the
+panic message is intentionally explicit so the crash is unambiguous.)
+
 ## Maintenance mode
 
-When the node is in maintenance mode, `Submit` becomes a no-op — the
-orchestrator does not start new recoveries. Already-running recoveries
-run to completion. To pause an in-flight one, cancel via the endpoint
-above.
+When the node is in maintenance mode, the orchestrator does not start new
+recoveries — `Submit` declines the work, and a missing-dir shard
+discovered at startup falls back to the normal init path (empty dir +
+async-rep backfill) rather than being parked in `RECOVERING`.
+Already-running recoveries run to completion. To pause an in-flight one,
+cancel via the endpoint above.
 
 ## Downgrade safety
 

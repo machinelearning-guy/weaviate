@@ -64,6 +64,13 @@ var ErrSelfRecoveryCancelled = errors.New("self-recovery op was cancelled")
 // REST handler maps it to 404 instead of 500.
 var ErrSelfRecoveryShardNotInSchema = errors.New("shard not in local schema")
 
+// ErrSelfRecoveryShardAlreadyLive is the sentinel returned by Restart
+// when the shard already has a live on-disk directory (i.e. recovery has
+// already completed or the shard was never recovering). The REST handler
+// maps it to 409 Conflict. Operators who want to re-pull a healthy shard
+// must cancel any in-flight op first and remove the directory by hand.
+var ErrSelfRecoveryShardAlreadyLive = errors.New("shard already has a live local directory; /restart is only valid while the shard is RECOVERING")
+
 // RaftEntryPoint is the subset of *cluster.Raft used by the orchestrator;
 // defined locally so tests can stub it.
 type RaftEntryPoint interface {
@@ -101,12 +108,13 @@ type Orchestrator struct {
 	concurrency            *runtime.DynamicValue[int]
 	maintenanceModeEnabled func() bool // nil-safe; treated as off when nil
 	onRecoveryComplete     func(ctx context.Context, collection, shard string) error
-	raftBootstrapComplete  func() bool // nil-safe; treated as already-complete when nil
 	logger                 logrus.FieldLogger
 	pollInterval           time.Duration
 	probeTimeout           time.Duration
 	probeBackoffMin        time.Duration
 	probeBackoffMax        time.Duration
+	restartTimeout         time.Duration  // caps Restart's cancel+settle loop
+	vanishedGracePeriod    time.Duration  // extra wait when a polled op vanishes
 	emptyFallbackHook      func(ShardRef) // nil unless overridden in tests
 	metrics                *Metrics
 
@@ -114,8 +122,9 @@ type Orchestrator struct {
 	// when N>>concurrency shards need recovery (e.g. wiped node with
 	// many shards). Concurrency = number of workers; queue capacity
 	// holds the burst.
-	poolOnce  sync.Once
-	workQueue chan submission
+	poolOnce            sync.Once
+	workQueue           chan submission
+	submitQueueCapacity int // defaultSubmitQueueCapacity unless overridden in tests
 
 	// Per-orchestrator RNG, seeded from wall-clock at construction so
 	// different nodes shuffle peer order differently. Guarded by rngMu
@@ -127,12 +136,18 @@ type Orchestrator struct {
 type submission struct {
 	ctx context.Context
 	ref ShardRef
+	// fromBootstrap is captured at submit time (not read later via a
+	// shared flag) so an empty-fallback that takes a few seconds of peer
+	// probing isn't misclassified when RAFT bootstrap completes meanwhile.
+	fromBootstrap bool
 }
 
-// submitQueueCapacity bounds the in-flight submission backlog. If
+// defaultSubmitQueueCapacity bounds the in-flight submission backlog. If
 // exceeded, Submit drops the request with a metric/log so memory stays
-// bounded. Dropped shards are retried on the next node restart.
-const submitQueueCapacity = 1024
+// bounded regardless of how many shards a wiped node needs. Dropped
+// shards fall back to normal init at startup and are retried on the next
+// node restart. Overridable per-orchestrator (tests).
+const defaultSubmitQueueCapacity = 1024
 
 type Config struct {
 	Raft          RaftEntryPoint
@@ -153,11 +168,7 @@ type Config struct {
 	// (The SELF_RECOVERY-op path doesn't need it; the consumer's
 	// LoadLocalShard handles the swap.)
 	OnRecoveryComplete func(ctx context.Context, collection, shard string) error
-	// RaftBootstrapComplete reports whether RAFT FSM replay is done.
-	// Empty-fallback during the bootstrap window is downgraded
-	// (likely a brand-new class added during downtime, not data loss).
-	RaftBootstrapComplete func() bool
-	Logger                logrus.FieldLogger
+	Logger             logrus.FieldLogger
 	// PollInterval is FSM-polling cadence after registering an op. 5s if zero.
 	PollInterval time.Duration
 	// ProbeTimeout caps a single ListFiles probe RPC. 5s if zero.
@@ -188,12 +199,14 @@ func New(cfg Config) *Orchestrator {
 		concurrency:            cfg.Concurrency,
 		maintenanceModeEnabled: cfg.MaintenanceModeEnabled,
 		onRecoveryComplete:     cfg.OnRecoveryComplete,
-		raftBootstrapComplete:  cfg.RaftBootstrapComplete,
 		logger:                 logger.WithField("component", "self_recovery"),
 		pollInterval:           pollInterval,
 		probeTimeout:           probeTimeout,
 		probeBackoffMin:        5 * time.Second,
 		probeBackoffMax:        5 * time.Minute,
+		restartTimeout:         30 * time.Second,
+		vanishedGracePeriod:    10 * time.Second,
+		submitQueueCapacity:    defaultSubmitQueueCapacity,
 		metrics:                GlobalMetrics(),
 		rng:                    rand.New(rand.NewSource(cryptoSeed())),
 	}
@@ -213,15 +226,18 @@ func cryptoSeed() int64 {
 	return int64(binary.LittleEndian.Uint64(b[:]))
 }
 
-// Submit asynchronously starts recovery for the shard. No-op when the
-// feature flag is off or maintenance mode is on. Returns immediately;
-// the worker pool (size = Config.Concurrency) drains the queue.
-// If the queue is full (submitQueueCapacity bursts exceeded), the
-// submission is dropped with a warning + metric — operator can re-trigger
-// or wait for the next node restart.
-func (o *Orchestrator) Submit(ctx context.Context, ref ShardRef) {
+// Submit asynchronously starts recovery for the shard. Returns true when
+// the work was queued, false when it was not — because the feature flag
+// is off, maintenance mode is on, or the in-flight queue is full
+// (submitQueueCapacity bursts exceeded; a warning + metric is emitted in
+// that case). Callers that installed a RecoveringShard wrapper MUST fall
+// back to normal shard init when this returns false, otherwise the shard
+// stays load-blocked until the next node restart. fromBootstrap tags the
+// op so an empty-fallback during the RAFT bootstrap window is logged and
+// counted less alarmingly (likely a fresh class added during downtime).
+func (o *Orchestrator) Submit(ctx context.Context, ref ShardRef, fromBootstrap bool) bool {
 	if o.enabled == nil || !o.enabled.Get() {
-		return
+		return false
 	}
 	if o.maintenanceModeEnabled != nil && o.maintenanceModeEnabled() {
 		o.logger.WithFields(logrus.Fields{
@@ -229,11 +245,12 @@ func (o *Orchestrator) Submit(ctx context.Context, ref ShardRef) {
 			"collection": ref.Collection,
 			"shard":      ref.Shard,
 		}).Info("self-recovery skipped: node is in maintenance mode")
-		return
+		return false
 	}
 	o.poolOnce.Do(o.initPool)
 	select {
-	case o.workQueue <- submission{ctx: ctx, ref: ref}:
+	case o.workQueue <- submission{ctx: ctx, ref: ref, fromBootstrap: fromBootstrap}:
+		return true
 	default:
 		if o.metrics != nil {
 			o.metrics.SubmitDroppedTotal.Inc()
@@ -242,8 +259,9 @@ func (o *Orchestrator) Submit(ctx context.Context, ref ShardRef) {
 			"event":      "self_recovery.submit_dropped",
 			"collection": ref.Collection,
 			"shard":      ref.Shard,
-			"queue_cap":  submitQueueCapacity,
+			"queue_cap":  o.submitQueueCapacity,
 		}).Warn("self-recovery submission dropped: queue full")
+		return false
 	}
 }
 
@@ -255,15 +273,12 @@ func (o *Orchestrator) Enabled() bool {
 }
 
 // SubmitRecovery is the primitive-typed entry point for callers that
-// can't import this package without a cycle.
-func (o *Orchestrator) SubmitRecovery(ctx context.Context, collection, shard string) {
-	o.Submit(ctx, ShardRef{Collection: collection, Shard: shard})
+// can't import this package without a cycle. Returns false if the work
+// was not queued (see Submit) — the caller must fall back to normal shard
+// init in that case.
+func (o *Orchestrator) SubmitRecovery(ctx context.Context, collection, shard string, fromBootstrap bool) bool {
+	return o.Submit(ctx, ShardRef{Collection: collection, Shard: shard}, fromBootstrap)
 }
-
-// restartTimeout caps the total time Restart spends cancelling and
-// waiting for in-flight ops to settle. Without this, a partial-outage
-// cluster (transient FSM errors) makes waitForOpTerminal spin forever.
-const restartTimeout = 30 * time.Second
 
 // Restart cancels any in-flight SELF_RECOVERY op for (collection,
 // shard) targeting this node, waits for those ops to reach a terminal
@@ -271,8 +286,23 @@ const restartTimeout = 30 * time.Second
 // "<shard>.recovering/", then submits a fresh recovery. Bounded by
 // restartTimeout: on timeout, leaves the recovery dir intact and
 // returns ctx.Err() so the operator can retry.
+//
+// Rejected with ErrSelfRecoveryShardAlreadyLive when the live
+// "<shard>/" directory already exists — i.e. recovery has already
+// completed (or empty-fallback ran), and there is nothing to restart.
+// Restarting in that state would re-copy peer data over a healthy shard.
 func (o *Orchestrator) Restart(parentCtx context.Context, ref ShardRef) error {
-	ctx, cancel := context.WithTimeout(parentCtx, restartTimeout)
+	if o.pathResolver != nil {
+		livePath := o.pathResolver.ShardPath(ref.Collection, ref.Shard)
+		if _, err := os.Stat(livePath); err == nil {
+			return fmt.Errorf("restart recovery for %s/%s: %w (cancel any in-flight op via POST /replication/replicate/{id}/cancel)",
+				ref.Collection, ref.Shard, ErrSelfRecoveryShardAlreadyLive)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("restart recovery: stat live dir %q: %w", livePath, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(parentCtx, o.restartTimeout)
 	defer cancel()
 
 	cancelled, err := o.cancelInflightSelfRecoveryOps(ctx, ref)
@@ -303,8 +333,14 @@ func (o *Orchestrator) Restart(parentCtx context.Context, ref ShardRef) error {
 	// Re-submit with WithoutCancel so the spawned recovery goroutine
 	// survives the HTTP-request-bound parent ctx (which is canceled as
 	// soon as the handler returns). Values (tracing/logging) are still
-	// inherited from parentCtx.
-	o.Submit(context.WithoutCancel(parentCtx), ref)
+	// inherited from parentCtx. fromBootstrap=false: an operator-driven
+	// restart is by definition past the RAFT bootstrap window.
+	if !o.Submit(context.WithoutCancel(parentCtx), ref, false) && o.Enabled() {
+		// Cancel + erase succeeded but the fresh recovery couldn't be
+		// queued (worker queue full). Surface it so the operator retries;
+		// the shard stays in RECOVERING in the meantime.
+		return errors.New("restart recovery: re-submission was dropped (in-flight queue full); retry shortly")
+	}
 	return nil
 }
 
@@ -352,11 +388,40 @@ func (o *Orchestrator) cancelInflightSelfRecoveryOps(ctx context.Context, ref Sh
 	return cancelled, nil
 }
 
-// vanishedGracePeriod is the extra wait after waitForOpTerminal
-// observes ErrReplicationOperationNotFound — the consumer goroutine
-// may still be mid-download; this gives it time to notice the
-// cancellation and exit before RemoveAll wipes the recovery dir.
-const vanishedGracePeriod = 10 * time.Second
+// HasInflightReplicationOp reports whether a non-terminal replication op
+// (COPY, MOVE, or SELF_RECOVERY — any kind) already targets (collection,
+// shard) on this node. The startup recovery hook calls this before
+// installing a RecoveringShard wrapper: a node that restarts mid scale-out
+// COPY and then receives an InstallSnapshot would otherwise re-enter the
+// startup path (target dir not yet created), register a duplicate
+// SELF_RECOVERY op writing into "<shard>.recovering/", and clobber the
+// resumed COPY's output on rename. A "not found" answer from the FSM means
+// there are no ops at all → (false, nil). On any other error the caller
+// should treat it as "skip recovery" (conservative).
+func (o *Orchestrator) HasInflightReplicationOp(ctx context.Context, collection, shard string) (bool, error) {
+	if o.raft == nil {
+		return false, nil
+	}
+	ops, err := o.raft.GetReplicationDetailsByCollectionAndShard(ctx, collection, shard)
+	if err != nil {
+		if errors.Is(err, replicationtypes.ErrReplicationOperationNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, op := range ops {
+		if op.TargetNodeId != o.nodeName {
+			continue
+		}
+		switch api.ShardReplicationState(op.Status.State) {
+		case api.READY, api.CANCELLED:
+			// terminal — no longer touching the shard dir
+		default:
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
 // waitForOpTerminal polls the FSM until the op reaches READY or
 // CANCELLED. A vanished op (force-deleted upstream) is treated as
@@ -373,7 +438,7 @@ func (o *Orchestrator) waitForOpTerminal(ctx context.Context, uuid strfmt.UUID) 
 		details, err := o.raft.GetReplicationDetailsByReplicationId(ctx, uuid)
 		if err != nil {
 			if errors.Is(err, replicationtypes.ErrReplicationOperationNotFound) {
-				if !sleepCtx(ctx, vanishedGracePeriod) {
+				if !sleepCtx(ctx, o.vanishedGracePeriod) {
 					return ctx.Err()
 				}
 				return nil
@@ -503,8 +568,11 @@ func (o *Orchestrator) AcceptEmpty(ctx context.Context, ref ShardRef) (string, e
 	return livePath, nil
 }
 
-// runOne is the per-shard worker.
-func (o *Orchestrator) runOne(ctx context.Context, ref ShardRef) {
+// runOne is the per-shard worker: probe peers, act on the decision, and
+// back off & retry on transient errors up to maxAttempts. On give-up the
+// shard is left in RECOVERING — operators recover via the
+// /debug/self-recovery/{restart,accept-empty} endpoints.
+func (o *Orchestrator) runOne(ctx context.Context, ref ShardRef, fromBootstrap bool) {
 	logger := o.logger.WithFields(logrus.Fields{
 		"event":      "self_recovery.started",
 		"collection": ref.Collection,
@@ -520,143 +588,166 @@ func (o *Orchestrator) runOne(ctx context.Context, ref ShardRef) {
 
 	const maxAttempts = 10
 	attempts := 0
-
 	backoff := o.probeBackoffMin
+
+	retryAfterBackoff := func() bool {
+		attempts++
+		if !sleepCtx(ctx, backoff) {
+			return false
+		}
+		backoff = nextBackoff(backoff, o.probeBackoffMax)
+		return true
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		if attempts >= maxAttempts {
-			logger.WithField("attempts", attempts).Error("self-recovery exhausted retries; giving up")
+			logger.WithField("attempts", attempts).Error("self-recovery exhausted retries; giving up. " +
+				"Shard stays in RECOVERING — use POST /debug/self-recovery/restart to retry from scratch, " +
+				"or POST /debug/self-recovery/accept-empty to accept an empty shard")
 			if o.metrics != nil {
 				o.metrics.GiveupTotal.Inc()
-				o.metrics.CompletedTotal.WithLabelValues("failure").Inc()
-				o.metrics.DurationSeconds.WithLabelValues("failure").Observe(time.Since(startedAt).Seconds())
 			}
+			o.recordOutcome("failure", "failure", startedAt)
 			return
 		}
 
 		decision, err := o.probeAndDecide(ctx, ref)
 		if err != nil {
-			attempts++
 			logger.WithError(err).Warn("self-recovery probe failed; will retry")
-			if !sleepCtx(ctx, backoff) {
+			if !retryAfterBackoff() {
 				return
 			}
-			backoff = nextBackoff(backoff, o.probeBackoffMax)
 			continue
 		}
 
 		switch decision.action {
 		case actionRegisterOp:
-			if o.metrics != nil {
-				o.metrics.StartedTotal.WithLabelValues(decision.sourceNode).Inc()
+			done, retry := o.handleRegisterDecision(ctx, ref, decision, startedAt, logger)
+			if done {
+				return
 			}
-			if err := o.registerAndPoll(ctx, ref, decision.sourceNode); err != nil {
-				// If the op was force-deleted upstream (class/tenant
-				// removed, operator ForceDelete*), there is nothing to
-				// re-register against — exit cleanly instead of
-				// looping until maxAttempts.
-				if errors.Is(err, replicationtypes.ErrReplicationOperationNotFound) {
-					logger.WithError(err).WithField("source_node", decision.sourceNode).
-						Info("self-recovery op was force-deleted; abandoning")
-					if o.metrics != nil {
-						o.metrics.CompletedTotal.WithLabelValues("cancelled").Inc()
-					}
-					return
-				}
-				// Operator-driven cancel via /replication/replicate/{id}/cancel
-				// is a terminal outcome — retrying would re-register a fresh
-				// SELF_RECOVERY op and negate the cancel.
-				if errors.Is(err, ErrSelfRecoveryCancelled) {
-					logger.WithError(err).WithField("source_node", decision.sourceNode).
-						Info("self-recovery op cancelled; abandoning")
-					if o.metrics != nil {
-						o.metrics.CompletedTotal.WithLabelValues("cancelled").Inc()
-						o.metrics.DurationSeconds.WithLabelValues("cancelled").Observe(time.Since(startedAt).Seconds())
-					}
-					return
-				}
-				attempts++
-				logger.WithError(err).WithField("source_node", decision.sourceNode).
-					Warn("self-recovery register/poll failed; will retry")
-				if !sleepCtx(ctx, backoff) {
-					return
-				}
-				backoff = nextBackoff(backoff, o.probeBackoffMax)
-				continue
+			if retry && !retryAfterBackoff() {
+				return
 			}
-			if o.metrics != nil {
-				o.metrics.CompletedTotal.WithLabelValues("success").Inc()
-				o.metrics.DurationSeconds.WithLabelValues("success").Observe(time.Since(startedAt).Seconds())
-			}
-			logger.WithFields(logrus.Fields{
-				"event":       "self_recovery.completed",
-				"source_node": decision.sourceNode,
-				"duration_ms": time.Since(startedAt).Milliseconds(),
-			}).Info("self-recovery completed")
-			return
-
 		case actionEmptyFallback:
-			if err := o.emptyFallback(ref); err != nil {
-				logger.WithError(err).Error("self-recovery empty-fallback failed")
-				if o.metrics != nil {
-					o.metrics.CompletedTotal.WithLabelValues("failure").Inc()
-					o.metrics.DurationSeconds.WithLabelValues("failure").Observe(time.Since(startedAt).Seconds())
-				}
-				return
-			}
-			// Promote the in-memory wrapper so reads/writes resume.
-			if o.onRecoveryComplete != nil {
-				if err := o.onRecoveryComplete(ctx, ref.Collection, ref.Shard); err != nil {
-					logger.WithError(err).Error("self-recovery: promote after empty-fallback failed")
-				}
-			}
-			// Bootstrap-window empty-fallback is most likely a class
-			// added during this node's downtime, not data loss.
-			// Demote signal severity and route to a separate counter so
-			// catastrophic-wipe alerts (no_data_empty_total) stay clean.
-			bootstrapWindow := o.raftBootstrapComplete != nil && !o.raftBootstrapComplete()
-			if o.metrics != nil {
-				if bootstrapWindow {
-					o.metrics.NoDataDuringBootstrapTotal.Inc()
-				} else {
-					o.metrics.NoDataEmptyTotal.Inc()
-				}
-				o.metrics.CompletedTotal.WithLabelValues("success").Inc()
-				o.metrics.DurationSeconds.WithLabelValues("empty_fallback").Observe(time.Since(startedAt).Seconds())
-			}
-			fallbackFields := logrus.Fields{
-				"event":        "self_recovery.empty_fallback",
-				"probed_peers": decision.probedPeers,
-				"duration_ms":  time.Since(startedAt).Milliseconds(),
-				"collection":   ref.Collection,
-				"shard":        ref.Shard,
-				"action_taken": "created_empty_shard",
-			}
-			if bootstrapWindow {
-				logger.WithFields(fallbackFields).
-					Info("no peer has data for shard during bootstrap; treating as fresh class")
-			} else {
-				fallbackFields["recoverable"] = false
-				fallbackFields["operator_note"] = "if data is recoverable from backup, restore now"
-				logger.WithFields(fallbackFields).
-					Warn("no peer has data for shard; created empty shard")
-			}
-			if o.emptyFallbackHook != nil {
-				o.emptyFallbackHook(ref)
-			}
+			o.handleEmptyFallback(ctx, ref, decision, startedAt, fromBootstrap, logger)
 			return
-
 		case actionRetry:
-			attempts++
 			logger.WithField("retry_in", backoff.String()).Debug("self-recovery: peers unreachable, will retry")
-			if !sleepCtx(ctx, backoff) {
+			if !retryAfterBackoff() {
 				return
 			}
-			backoff = nextBackoff(backoff, o.probeBackoffMax)
-			continue
 		}
+	}
+}
+
+// recordOutcome records the terminal-result metrics for a recovery.
+// completedResult is the weaviate_self_recovery_completed_total label
+// (success|failure|cancelled); durationResult is the
+// weaviate_self_recovery_duration_seconds label (which additionally has
+// empty_fallback). Nil-safe on o.metrics.
+func (o *Orchestrator) recordOutcome(completedResult, durationResult string, startedAt time.Time) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.CompletedTotal.WithLabelValues(completedResult).Inc()
+	o.metrics.DurationSeconds.WithLabelValues(durationResult).Observe(time.Since(startedAt).Seconds())
+}
+
+// handleRegisterDecision registers a SELF_RECOVERY op and polls it to a
+// terminal state. Returns done=true when nothing further should be
+// attempted (the op reached READY, or was operator-cancelled /
+// force-deleted), retry=true when a transient error means the caller
+// should back off and probe again.
+func (o *Orchestrator) handleRegisterDecision(ctx context.Context, ref ShardRef, decision probeDecision,
+	startedAt time.Time, logger logrus.FieldLogger,
+) (done, retry bool) {
+	if o.metrics != nil {
+		o.metrics.StartedTotal.WithLabelValues(decision.sourceNode).Inc()
+	}
+	err := o.registerAndPoll(ctx, ref, decision.sourceNode)
+	if err == nil {
+		o.recordOutcome("success", "success", startedAt)
+		logger.WithFields(logrus.Fields{
+			"event":       "self_recovery.completed",
+			"source_node": decision.sourceNode,
+			"duration_ms": time.Since(startedAt).Milliseconds(),
+		}).Info("self-recovery completed")
+		return true, false
+	}
+	// If the op was force-deleted upstream (class/tenant removed, operator
+	// ForceDelete*), there is nothing to re-register against — exit cleanly
+	// instead of looping until maxAttempts. Operator-driven cancel via
+	// /replication/replicate/{id}/cancel is likewise terminal — retrying
+	// would re-register a fresh op and negate the cancel.
+	switch {
+	case errors.Is(err, replicationtypes.ErrReplicationOperationNotFound):
+		logger.WithError(err).WithField("source_node", decision.sourceNode).
+			Info("self-recovery op was force-deleted; abandoning")
+		o.recordOutcome("cancelled", "cancelled", startedAt)
+		return true, false
+	case errors.Is(err, ErrSelfRecoveryCancelled):
+		logger.WithError(err).WithField("source_node", decision.sourceNode).
+			Info("self-recovery op cancelled; abandoning")
+		o.recordOutcome("cancelled", "cancelled", startedAt)
+		return true, false
+	default:
+		logger.WithError(err).WithField("source_node", decision.sourceNode).
+			Warn("self-recovery register/poll failed; will retry")
+		return false, true
+	}
+}
+
+// handleEmptyFallback materialises an empty live shard dir, promotes the
+// in-memory wrapper, and records the outcome. fromBootstrap selects the
+// gentler log/metric treatment for the RAFT-bootstrap-window case (an
+// all-peers-empty answer there most likely means a class was added during
+// this node's downtime, not data loss).
+func (o *Orchestrator) handleEmptyFallback(ctx context.Context, ref ShardRef, decision probeDecision,
+	startedAt time.Time, fromBootstrap bool, logger logrus.FieldLogger,
+) {
+	if err := o.emptyFallback(ref); err != nil {
+		logger.WithError(err).Error("self-recovery empty-fallback failed")
+		o.recordOutcome("failure", "failure", startedAt)
+		return
+	}
+	// Promote the in-memory wrapper so reads/writes resume.
+	if o.onRecoveryComplete != nil {
+		if err := o.onRecoveryComplete(ctx, ref.Collection, ref.Shard); err != nil {
+			logger.WithError(err).Error("self-recovery: promote after empty-fallback failed")
+		}
+	}
+	if o.metrics != nil {
+		if fromBootstrap {
+			o.metrics.NoDataDuringBootstrapTotal.Inc()
+		} else {
+			o.metrics.NoDataEmptyTotal.Inc()
+		}
+	}
+	o.recordOutcome("success", "empty_fallback", startedAt)
+
+	fallbackFields := logrus.Fields{
+		"event":        "self_recovery.empty_fallback",
+		"probed_peers": decision.probedPeers,
+		"duration_ms":  time.Since(startedAt).Milliseconds(),
+		"collection":   ref.Collection,
+		"shard":        ref.Shard,
+		"action_taken": "created_empty_shard",
+	}
+	if fromBootstrap {
+		logger.WithFields(fallbackFields).
+			Info("no peer has data for shard during RAFT bootstrap; treating as fresh class")
+	} else {
+		fallbackFields["recoverable"] = false
+		fallbackFields["operator_note"] = "if data is recoverable from backup, restore now"
+		logger.WithFields(fallbackFields).
+			Warn("no peer has data for shard; created empty shard")
+	}
+	if o.emptyFallbackHook != nil {
+		o.emptyFallbackHook(ref)
 	}
 }
 
@@ -720,7 +811,7 @@ func (o *Orchestrator) probeAndDecide(ctx context.Context, ref ShardRef) (probeD
 	wg.Wait()
 
 	var (
-		probedPeers        []string
+		probedPeers        = make([]string, 0, len(results))
 		anyDefinitiveEmpty bool
 		anyUnreachable     bool
 		firstSource        string
@@ -931,8 +1022,10 @@ func (o *Orchestrator) emptyFallback(ref ShardRef) error {
 }
 
 // initPool spawns the worker pool on first Submit. Worker count =
-// Config.Concurrency (default 1). The buffered queue absorbs bursts up
-// to submitQueueCapacity; beyond that, Submit drops with a warning.
+// Config.Concurrency.Get() when positive (the env-backed config supplies
+// DefaultSelfRecoveryConcurrency); falls back to 1 only if Concurrency is
+// nil or non-positive. The buffered queue absorbs bursts up to
+// o.submitQueueCapacity; beyond that, Submit drops with a warning.
 func (o *Orchestrator) initPool() {
 	n := 1
 	if o.concurrency != nil {
@@ -940,11 +1033,15 @@ func (o *Orchestrator) initPool() {
 			n = v
 		}
 	}
-	o.workQueue = make(chan submission, submitQueueCapacity)
+	capacity := o.submitQueueCapacity
+	if capacity <= 0 {
+		capacity = defaultSubmitQueueCapacity
+	}
+	o.workQueue = make(chan submission, capacity)
 	for i := 0; i < n; i++ {
 		enterrors.GoWrapper(func() {
 			for sub := range o.workQueue {
-				o.runOne(sub.ctx, sub.ref)
+				o.runOne(sub.ctx, sub.ref, sub.fromBootstrap)
 			}
 		}, o.logger)
 	}
