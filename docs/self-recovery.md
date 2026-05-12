@@ -45,6 +45,7 @@ transfer type and reject it). Same caveat as `REPLICA_MOVEMENT_ENABLED`.
 | `weaviate_self_recovery_unreachable_peer_total` | counter | `peer` | peer reachability problems |
 | `weaviate_self_recovery_giveup_total` | counter | — | retries exhausted |
 | `weaviate_self_recovery_accept_empty_total` | counter | — | operator escape-hatch invocations |
+| `weaviate_self_recovery_submit_dropped_total` | counter | — | submissions dropped because the in-process worker queue was full (will retry on next restart) |
 
 Per-(collection, shard) drill-down is available via `/replication/replicate/list`
 and the structured logs.

@@ -33,9 +33,9 @@ import (
 	graphqlhelper "github.com/weaviate/weaviate/test/helper/graphql"
 )
 
-// stopNodeAt stops the node container at the given index.
+// StopNodeAt stops the node container at the given index.
 //
-// NOTE: the index is 1-based, so stopping the first node requires index=1, not 0
+// NOTE: the index is 0-based, so stopping the first node requires index=0.
 func StopNodeAt(ctx context.Context, t *testing.T, compose *docker.DockerCompose, index int) {
 	<-time.After(1 * time.Second)
 	if err := compose.StopAt(ctx, index, nil); err != nil {
@@ -46,6 +46,10 @@ func StopNodeAt(ctx context.Context, t *testing.T, compose *docker.DockerCompose
 	<-time.After(1 * time.Second) // give time for shutdown
 }
 
+// StopNodeAtWithTimeout is StopNodeAt with an explicit graceful-shutdown
+// timeout (timeout=0 = SIGKILL).
+//
+// NOTE: the index is 0-based, so stopping the first node requires index=0.
 func StopNodeAtWithTimeout(ctx context.Context, t *testing.T, compose *docker.DockerCompose, index int, timeout time.Duration) {
 	<-time.After(1 * time.Second)
 	if err := compose.StopAt(ctx, index, &timeout); err != nil {

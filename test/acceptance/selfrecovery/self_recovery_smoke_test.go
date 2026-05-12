@@ -48,6 +48,7 @@ func TestSelfRecoverySmokeWiring(t *testing.T) {
 		WithWeaviateCluster(3).
 		WithWeaviateEnv("SELF_RECOVERY_ENABLED", "true").
 		WithWeaviateEnv("SELF_RECOVERY_CONCURRENCY", "2").
+		WithWeaviateWithDebugPort(). // /debug/self-recovery/* lives on the profiling port
 		Start(ctx)
 	require.NoError(t, err)
 	defer func() {
@@ -65,17 +66,20 @@ func TestSelfRecoverySmokeWiring(t *testing.T) {
 
 	// accept-empty debug endpoint is reachable. We probe with a
 	// non-existent (collection, shard) and verify the endpoint responds
-	// with a non-5xx status. Validates the handler is registered.
+	// with a 404 from the schema gate. Validates the handler is
+	// registered AND that the schema-error → 404 mapping is in place
+	// (rather than the generic 500 the handler used to return for
+	// validation failures).
 	t.Run("accept_empty_endpoint_is_reachable", func(t *testing.T) {
+		debugURI := compose.GetWeaviate().DebugURI()
+		require.NotEmpty(t, debugURI, "DebugURI is empty — was WithWeaviateWithDebugPort() called?")
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			"http://"+compose.GetWeaviate().URI()+"/debug/self-recovery/accept-empty?collection=NoSuchClass&shard=NoSuchShard", nil)
+			"http://"+debugURI+"/debug/self-recovery/accept-empty?collection=NoSuchClass&shard=NoSuchShard", nil)
 		require.NoError(t, err)
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		// AcceptEmpty rejects unknown classes with the schema check —
-		// expect a 4xx (BadRequest/NotFound). 5xx would indicate a
-		// wiring problem.
-		require.Less(t, resp.StatusCode, 500, "status: %d", resp.StatusCode)
+		require.Equal(t, http.StatusNotFound, resp.StatusCode,
+			"unknown class/shard should yield 404 (schema gate); got %d", resp.StatusCode)
 	})
 }

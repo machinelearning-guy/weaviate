@@ -12,6 +12,7 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -63,10 +64,18 @@ func setupSelfRecoveryHandlers(appState *state.State, orch *selfrecovery.Orchest
 			http.Error(w, "self-recovery is not configured on this node", http.StatusServiceUnavailable)
 			return
 		}
-		path, err := orch.AcceptEmpty(selfrecovery.ShardRef{Collection: collection, Shard: shard})
+		// WithoutCancel: AcceptEmpty's promotion step (LoadLocalShard)
+		// can outlive the HTTP request; preserve values for tracing.
+		path, err := orch.AcceptEmpty(context.WithoutCancel(r.Context()), selfrecovery.ShardRef{Collection: collection, Shard: shard})
 		if err != nil {
 			logger.WithError(err).WithField("collection", collection).WithField("shard", shard).
 				Error("self-recovery accept-empty failed")
+			// Schema-gate failure (unknown collection/shard) is a
+			// client-side mistake, not a 500 — surface as 404.
+			if errors.Is(err, selfrecovery.ErrSelfRecoveryShardNotInSchema) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -101,7 +110,11 @@ func setupSelfRecoveryHandlers(appState *state.State, orch *selfrecovery.Orchest
 			http.Error(w, "self-recovery is not configured on this node", http.StatusServiceUnavailable)
 			return
 		}
-		if err := orch.RestartRecovery(r.Context(), collection, shard); err != nil {
+		// WithoutCancel: Restart re-submits the recovery using the
+		// passed ctx; if we used r.Context() the resubmit would be
+		// canceled the moment the handler returned. Values (tracing)
+		// are still inherited.
+		if err := orch.RestartRecovery(context.WithoutCancel(r.Context()), collection, shard); err != nil {
 			logger.WithError(err).WithField("collection", collection).WithField("shard", shard).
 				Error("self-recovery restart failed")
 			http.Error(w, err.Error(), http.StatusInternalServerError)

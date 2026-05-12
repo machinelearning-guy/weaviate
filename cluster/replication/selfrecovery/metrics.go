@@ -26,7 +26,7 @@ type Metrics struct {
 	InProgress                 prometheus.Gauge
 	StartedTotal               *prometheus.CounterVec   // labels: source_node
 	CompletedTotal             *prometheus.CounterVec   // labels: result (success|failure|cancelled)
-	DurationSeconds            *prometheus.HistogramVec // labels: result (success|failure|empty_fallback)
+	DurationSeconds            *prometheus.HistogramVec // labels: result (success|failure|empty_fallback|cancelled)
 	NoDataEmptyTotal           prometheus.Counter
 	NoDataDuringBootstrapTotal prometheus.Counter
 	UnreachablePeerTotal       *prometheus.CounterVec // labels: peer
@@ -59,7 +59,7 @@ func GlobalMetrics() *Metrics {
 			}, []string{"result"}),
 			DurationSeconds: promauto.NewHistogramVec(prometheus.HistogramOpts{
 				Name:    "weaviate_self_recovery_duration_seconds",
-				Help:    "End-to-end duration of a self-recovery operation, by terminal result (success|failure|empty_fallback).",
+				Help:    "End-to-end duration of a self-recovery operation, by terminal result (success|failure|empty_fallback|cancelled).",
 				Buckets: prometheus.ExponentialBuckets(10, 2, 10), // 10s, 20s, 40s, ... ~1.4h
 			}, []string{"result"}),
 			NoDataEmptyTotal: promauto.NewCounter(prometheus.CounterOpts{

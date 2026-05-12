@@ -58,6 +58,12 @@ import (
 // "cancelled") from transient errors (retry with backoff).
 var ErrSelfRecoveryCancelled = errors.New("self-recovery op was cancelled")
 
+// ErrSelfRecoveryShardNotInSchema is the sentinel returned by AcceptEmpty
+// (and any other operator endpoint that uses the schema gate) when the
+// requested (collection, shard) is not present in the local schema. The
+// REST handler maps it to 404 instead of 500.
+var ErrSelfRecoveryShardNotInSchema = errors.New("shard not in local schema")
+
 // RaftEntryPoint is the subset of *cluster.Raft used by the orchestrator;
 // defined locally so tests can stub it.
 type RaftEntryPoint interface {
@@ -294,9 +300,11 @@ func (o *Orchestrator) Restart(parentCtx context.Context, ref ShardRef) error {
 		"cancelled_ops": cancelled,
 	}).Warn("operator restarted self-recovery from scratch")
 
-	// Submit uses the parent ctx so the spawned recovery goroutine
-	// is not cancelled when the HTTP-request-bound ctx expires.
-	o.Submit(parentCtx, ref)
+	// Re-submit with WithoutCancel so the spawned recovery goroutine
+	// survives the HTTP-request-bound parent ctx (which is canceled as
+	// soon as the handler returns). Values (tracing/logging) are still
+	// inherited from parentCtx.
+	o.Submit(context.WithoutCancel(parentCtx), ref)
 	return nil
 }
 
@@ -335,9 +343,10 @@ func (o *Orchestrator) cancelInflightSelfRecoveryOps(ctx context.Context, ref Sh
 		if err := o.raft.CancelReplication(ctx, op.Uuid); err != nil {
 			return cancelled, fmt.Errorf("cancel op %s: %w", op.Uuid, err)
 		}
-		if o.metrics != nil {
-			o.metrics.CompletedTotal.WithLabelValues("cancelled").Inc()
-		}
+		// CompletedTotal{result="cancelled"} is incremented by runOne
+		// when it observes the FSM's CANCELLED state — the single
+		// source of truth. Doing it here too would double-count, and
+		// would also tick even if the cancel never propagated.
 		cancelled = append(cancelled, op.Uuid)
 	}
 	return cancelled, nil
@@ -435,9 +444,12 @@ func (o *Orchestrator) CleanupOrphanRecoveryDirs(rootDataPath string) ([]string,
 
 // AcceptEmpty is the operator escape hatch for the catastrophic-wipe
 // case (no peer has the data). It removes "<shard>.recovering/" and
-// creates an empty "<shard>/". Does NOT cancel in-flight RAFT ops —
-// operator should call /replication/replicate/{id}/cancel first.
-func (o *Orchestrator) AcceptEmpty(ref ShardRef) (string, error) {
+// creates an empty "<shard>/", then promotes the in-memory wrapper so
+// the shard becomes serviceable (otherwise a RecoveringShard wrapper
+// would stay load-blocked despite the on-disk dir existing). Does NOT
+// cancel in-flight RAFT ops — operator should call
+// /replication/replicate/{id}/cancel first.
+func (o *Orchestrator) AcceptEmpty(ctx context.Context, ref ShardRef) (string, error) {
 	if o.pathResolver == nil {
 		return "", errors.New("accept-empty: no PathResolver configured")
 	}
@@ -446,7 +458,8 @@ func (o *Orchestrator) AcceptEmpty(ref ShardRef) (string, error) {
 	// root if the schema doesn't actually have this shard.
 	if o.schema != nil {
 		if _, err := o.schema.ShardReplicas(ref.Collection, ref.Shard); err != nil {
-			return "", fmt.Errorf("accept-empty: shard %s/%s not in schema: %w", ref.Collection, ref.Shard, err)
+			return "", fmt.Errorf("accept-empty: shard %s/%s: %w (%v)",
+				ref.Collection, ref.Shard, ErrSelfRecoveryShardNotInSchema, err)
 		}
 	}
 	livePath := o.pathResolver.ShardPath(ref.Collection, ref.Shard)
@@ -465,6 +478,17 @@ func (o *Orchestrator) AcceptEmpty(ref ShardRef) (string, error) {
 	}
 	if err := diskio.Fsync(filepath.Dir(livePath)); err != nil {
 		return "", fmt.Errorf("fsync parent of %q: %w", livePath, err)
+	}
+	// Promote the in-memory wrapper so the shard transitions out of
+	// RECOVERING and becomes serviceable. Mirrors the empty-fallback
+	// path inside runOne; without this, the operator's "accept empty"
+	// would leave the shard load-blocked behind a RecoveringShard
+	// wrapper despite the on-disk dir being ready.
+	if o.onRecoveryComplete != nil {
+		if err := o.onRecoveryComplete(ctx, ref.Collection, ref.Shard); err != nil {
+			return "", fmt.Errorf("accept-empty: promote in-memory wrapper for %s/%s: %w",
+				ref.Collection, ref.Shard, err)
+		}
 	}
 	if o.metrics != nil {
 		o.metrics.AcceptEmptyTotal.Inc()

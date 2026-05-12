@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/go-openapi/strfmt"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -414,7 +415,7 @@ func TestAcceptEmpty_RemovesRecoveryDir(t *testing.T) {
 	require.NoError(t, os.MkdirAll(recoveryPath, 0o755))
 	require.NoError(t, os.WriteFile(recoveryPath+"/leftover.bin", []byte("garbage"), 0o644))
 
-	got, err := o.AcceptEmpty(ShardRef{Collection: "C", Shard: "S"})
+	got, err := o.AcceptEmpty(context.Background(), ShardRef{Collection: "C", Shard: "S"})
 	require.NoError(t, err)
 	require.Equal(t, livePath, got)
 
@@ -604,4 +605,93 @@ func TestPerOrchestratorRNG_NotDeterministic(t *testing.T) {
 		}
 	}
 	require.True(t, differs, "per-orchestrator RNG produced identical shuffles across %d trials — global rand regression?", N+1)
+}
+
+// TestAcceptEmpty_PromotesInMemoryWrapper verifies the operator
+// escape-hatch invokes onRecoveryComplete after creating the empty
+// shard dir. Without this, a RecoveryShard wrapper installed by the
+// startup hook stays load-blocked forever despite disk being ready.
+// Mirrors the empty-fallback path inside runOne.
+func TestAcceptEmpty_PromotesInMemoryWrapper(t *testing.T) {
+	tmp := t.TempDir()
+	logger := logrus.New()
+	logger.SetLevel(logrus.PanicLevel)
+
+	var (
+		promoteCalls atomic.Int32
+		gotColl      atomic.Value
+		gotShard     atomic.Value
+	)
+	o := New(Config{
+		Raft:         &stubRaft{},
+		Schema:       stubSchema{}, // ShardReplicas returns nil err with default replicas
+		PathResolver: stubPathResolver{root: tmp},
+		NodeSelector: &stubNodeSelector{},
+		NodeName:     "self",
+		OnRecoveryComplete: func(_ context.Context, collection, shard string) error {
+			promoteCalls.Add(1)
+			gotColl.Store(collection)
+			gotShard.Store(shard)
+			return nil
+		},
+		Logger: logger,
+	})
+
+	_, err := o.AcceptEmpty(context.Background(), ShardRef{Collection: "C", Shard: "S"})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, promoteCalls.Load(), "OnRecoveryComplete must be called exactly once")
+	require.Equal(t, "C", gotColl.Load())
+	require.Equal(t, "S", gotShard.Load())
+}
+
+// TestAcceptEmpty_SchemaErrorIsTypedSentinel verifies that the schema
+// gate's error chain contains ErrSelfRecoveryShardNotInSchema. The REST
+// handler relies on this sentinel to map the failure to HTTP 404
+// instead of the generic 500.
+func TestAcceptEmpty_SchemaErrorIsTypedSentinel(t *testing.T) {
+	tmp := t.TempDir()
+	logger := logrus.New()
+	logger.SetLevel(logrus.PanicLevel)
+	o := New(Config{
+		Raft:         &stubRaft{},
+		Schema:       stubSchema{err: errors.New("class \"NoSuch\" not found in schema")},
+		PathResolver: stubPathResolver{root: tmp},
+		NodeSelector: &stubNodeSelector{},
+		NodeName:     "self",
+		Logger:       logger,
+	})
+
+	_, err := o.AcceptEmpty(context.Background(), ShardRef{Collection: "NoSuch", Shard: "S"})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrSelfRecoveryShardNotInSchema),
+		"error chain must contain ErrSelfRecoveryShardNotInSchema for handler 4xx mapping; got %v", err)
+}
+
+// TestCancelInflightSelfRecoveryOps_NoMetricDoubleCount verifies the
+// cancel path does NOT pre-increment CompletedTotal{result="cancelled"}
+// — runOne is the single source of truth, fired when the FSM state is
+// observed terminal. Pre-incrementing here used to double-count and
+// would also tick even if the cancel RPC ultimately failed.
+func TestCancelInflightSelfRecoveryOps_NoMetricDoubleCount(t *testing.T) {
+	raft := &stubRaft{
+		opsByCollShard: map[string][]api.ReplicationDetailsResponse{
+			"C/S": {{
+				Uuid:         strfmt.UUID("00000000-0000-0000-0000-000000000001"),
+				TransferType: api.SELF_RECOVERY.String(),
+				TargetNodeId: "self",
+				Status:       api.ReplicationDetailsState{State: string(api.HYDRATING)},
+			}},
+		},
+	}
+	o := newOrchestratorForTest(t, raft, stubSchema{}, &stubNodeSelector{}, nil, stubPathResolver{root: t.TempDir()})
+
+	before := testutil.ToFloat64(o.metrics.CompletedTotal.WithLabelValues("cancelled"))
+
+	cancelled, err := o.cancelInflightSelfRecoveryOps(context.Background(), ShardRef{Collection: "C", Shard: "S"})
+	require.NoError(t, err)
+	require.Len(t, cancelled, 1, "the SELF_RECOVERY HYDRATING op should have been cancelled")
+
+	after := testutil.ToFloat64(o.metrics.CompletedTotal.WithLabelValues("cancelled"))
+	require.Equal(t, before, after,
+		"cancelInflightSelfRecoveryOps must not increment CompletedTotal{cancelled} — runOne owns that metric")
 }

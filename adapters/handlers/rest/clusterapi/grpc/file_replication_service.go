@@ -91,7 +91,12 @@ func (fps *FileReplicationService) ListFiles(ctx context.Context, req *pb.ListFi
 
 	index := fps.repo.GetIndexForIncomingSharding(schema.ClassName(indexName))
 	if index == nil {
-		return nil, status.Errorf(codes.NotFound, "local index %q not found", indexName)
+		// Treat as transient: a nil index can mean the schema-replay
+		// hasn't reached this peer yet (eventual consistency), not just
+		// "this collection truly doesn't exist". NotFound would tell a
+		// self-recovery probe "definitive empty" and could push the
+		// orchestrator into the catastrophic-wipe empty-fallback path.
+		return nil, status.Errorf(codes.Unavailable, "local index %q not loaded yet", indexName)
 	}
 
 	files, err := index.IncomingListFiles(ctx, shardName)
