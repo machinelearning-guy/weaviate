@@ -563,7 +563,13 @@ func (d *Compose) WithMCPConfigFile(hostPath, containerPath string) *Compose {
 }
 
 func (d *Compose) WithWeaviateWithDebugPort() *Compose {
-	d.With1NodeCluster()
+	// Only default to a 1-node cluster when the caller hasn't already
+	// configured a size — otherwise this would silently overwrite e.g.
+	// WithWeaviateCluster(3) and the test would end up with a 1-node
+	// "cluster" that fails RF=3 schema operations.
+	if !d.withWeaviateCluster {
+		d.With1NodeCluster()
+	}
 	d.withWeaviateExposeDebugPort = true
 	return d
 }
