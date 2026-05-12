@@ -458,8 +458,9 @@ func (o *Orchestrator) AcceptEmpty(ctx context.Context, ref ShardRef) (string, e
 	// root if the schema doesn't actually have this shard.
 	if o.schema != nil {
 		if _, err := o.schema.ShardReplicas(ref.Collection, ref.Shard); err != nil {
-			return "", fmt.Errorf("accept-empty: shard %s/%s: %w (%v)",
-				ref.Collection, ref.Shard, ErrSelfRecoveryShardNotInSchema, err)
+			return "", fmt.Errorf("accept-empty: shard %s/%s: %w",
+				ref.Collection, ref.Shard,
+				errors.Join(ErrSelfRecoveryShardNotInSchema, err))
 		}
 	}
 	livePath := o.pathResolver.ShardPath(ref.Collection, ref.Shard)
