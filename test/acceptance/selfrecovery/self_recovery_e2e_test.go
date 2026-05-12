@@ -86,6 +86,11 @@ func TestSelfRecoveryEndToEnd(t *testing.T) {
 		// produce a snapshot — no timing dependency.
 		WithWeaviateEnv("RAFT_TRAILING_LOGS", "1").
 		WithWeaviateWithDebugPort(). // /debug/raft/snapshot lives on the profiling port
+		// Tmpfs at /data so WipeNodeDataAt's stop+start really
+		// empties the data dir (rm -rf via docker exec races with
+		// weaviate's own writes; tmpfs is auto-wiped on container
+		// stop).
+		WithWeaviateTmpfsData().
 		Start(ctx)
 	require.NoError(t, err)
 	defer func() {
@@ -282,6 +287,7 @@ func TestSelfRecoveryReadsContinueAtConsistencyONE(t *testing.T) {
 		// hits /debug/raft/snapshot before wipe.
 		WithWeaviateEnv("RAFT_TRAILING_LOGS", "1").
 		WithWeaviateWithDebugPort().
+		WithWeaviateTmpfsData().
 		Start(ctx)
 	require.NoError(t, err)
 	defer func() {

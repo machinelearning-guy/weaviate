@@ -59,11 +59,14 @@ func StopNodeAtWithTimeout(ctx context.Context, t *testing.T, compose *docker.Do
 // WipeNodeDataAt simulates a data-loss event by deleting the persistence
 // directory contents inside the container at the given (0-based) index,
 // then SIGKILL-stops the container. The caller restarts via StartNodeAt
-// to bring the node back up with an empty data dir. Used by SELF_RECOVERY
-// acceptance tests. The wipe runs against the live container (PERSISTENCE
-// data is inside the container's overlay fs, no host volume), so Weaviate's
-// open fds survive the unlink; the immediate SIGKILL stop avoids graceful
-// shutdown attempts against the now-missing files.
+// to bring the node back up with an empty data dir.
+//
+// The wipe is two-pronged: (1) rm -rf /data/* inside the live container
+// removes anything sitting in the writable layer; (2) when WithWeaviateTmpfsData
+// is set, the docker stop also unmounts the /data tmpfs, so even files
+// kept alive by weaviate's open fds disappear. SELF_RECOVERY tests rely
+// on (2) — without it, weaviate's writes between rm and SIGKILL race the
+// wipe and the post-restart /data is not empty.
 func WipeNodeDataAt(ctx context.Context, t *testing.T, compose *docker.DockerCompose, index int) {
 	t.Helper()
 	c, err := compose.ContainerAt(index)
