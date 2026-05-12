@@ -182,7 +182,9 @@ func (s *Service) batchDelete(ctx context.Context, req *pb.BatchDeleteRequest) (
 		tenant = *req.Tenant
 	}
 
-	req.Collection, _ = namespacing.Resolve(principal, s.schemaManager, s.config.Namespaces.Enabled, req.Collection)
+	if req.Collection, _, err = namespacing.Resolve(principal, s.schemaManager, s.config.Namespaces.Enabled, req.Collection); err != nil {
+		return nil, err
+	}
 
 	if err := s.authorizer.Authorize(ctx, principal, authorization.DELETE, authorization.ShardsData(req.Collection, tenant)...); err != nil {
 		return nil, err
